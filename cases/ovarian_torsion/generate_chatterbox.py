@@ -45,6 +45,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ref", help="optional voice-clone reference wav (~10 s)")
     ap.add_argument("--tries", type=int, default=4)
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--only", help="comma-separated line numbers to redo; other lines reuse lines/NN.wav")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -58,14 +60,23 @@ def main() -> None:
     lines = [l.strip() for l in (HERE / "script_devanagari.txt").read_text(encoding="utf-8").splitlines() if l.strip()]
     (HERE / "lines").mkdir(exist_ok=True)
 
+    only = {int(x) for x in args.only.split(",")} if args.only else None
+    qc_path = HERE / "qc.tsv"
+    old_qc = qc_path.read_text(encoding="utf-8").splitlines()[1:] if qc_path.exists() else []
     out, qc = [], ["line\ttake\tdur_s\tmax_s\tasr_score\tasr_text"]
     for n, line in enumerate(lines, 1):
+        if only is not None and n not in only and (HERE / "lines" / f"{n:02d}.wav").exists():
+            wav, _ = sf.read(HERE / "lines" / f"{n:02d}.wav", dtype="float32")
+            qc.append(old_qc[n - 1] if n - 1 < len(old_qc) else line)
+            out += [wav, np.zeros(int(sr * PAUSE_S.get(line, DEFAULT_PAUSE_S)), dtype=np.float32)]
+            continue
         max_s = 0.11 * len(norm(line)) + 0.9
         best = None
         for take in range(args.tries):
-            torch.manual_seed(1000 * n + take)
+            torch.manual_seed(1000 * n + take + 100 * (only is not None))
             wav = trim(tts.generate(line, language_id="hi", audio_prompt_path=args.ref,
-                                    exaggeration=0.5, cfg_weight=0.5).squeeze(0).cpu().numpy(), sr)
+                                    exaggeration=0.5, cfg_weight=0.5,
+                                    temperature=args.temperature).squeeze(0).cpu().numpy(), sr)
             dur = len(wav) / sr
             heard, score = "", 1.0
             if asr is not None:
@@ -80,7 +91,7 @@ def main() -> None:
             print(f"[{n:02d}.{take}] {dur:4.1f}s/{max_s:3.1f} asr={score:.2f} {'OK ' if ok else 'LONG'} {line} | {heard}", flush=True)
             if best is None or rank > best[0]:
                 best = (rank, take, wav, dur, max_s, score, heard)
-            if ok and score >= 0.6:
+            if ok and score >= 0.75:
                 break
         _, take, wav, dur, max_s, score, heard = best
         sf.write(HERE / "lines" / f"{n:02d}.wav", wav, sr)
